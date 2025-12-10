@@ -1,23 +1,3 @@
-Absolutely — here is a **clean, professional, GitHub-ready Markdown README** for your entire project.
-
-It describes:
-
-* What the system does
-* Hardware + sensor details
-* ESP32 firmware logic
-* Raspberry Pi MQTT logging
-* The SQL schema
-* The email-command system
-* Plotting modes (last48, last30, date range)
-* Raw-data export
-* Cron automation
-* Architecture diagram (ASCII)
-* Troubleshooting section
-
-You can paste this directly into `README.md`.
-
----
-
 # **Gas Meter Pulse Logger & Email-Controlled Plotting System**
 
 *A full end-to-end metering, logging, and remote-controlled plotting platform.*
@@ -28,7 +8,7 @@ You can paste this directly into `README.md`.
 
 This project implements a **complete gas-meter monitoring system** using:
 
-* **ESP32** with Hall sensor ? detects gas-meter magnetic pulses (0.01 m³ per pulse)
+* **ESP32** with Hall sensor ? detects gas-meter magnetic pulses (0.01 mï¿½ per pulse)
 * **Raspberry Pi** ? logs data via MQTT into SQLite
 * **Python email listener** ? accepts commands via email (Yahoo IMAP)
 * **Plot engine** ? generates charts (48-hour, 30-day, or arbitrary date range)
@@ -168,7 +148,7 @@ Only emails from the **trusted sender** are accepted.
 You receive a plot like this by email:
 
 * X-axis = exact timestamps
-* Y-axis = pulse count (0.01 m³)
+* Y-axis = pulse count (0.01 mï¿½)
 * Each event = vertical blue bar (alpha 0.6)
 
 ---
@@ -258,7 +238,7 @@ journalctl -u email_listener
 
 ### **Yahoo IMAP flakiness**
 
-Common — listener already retries automatically.
+Common ï¿½ listener already retries automatically.
 
 ---
 
