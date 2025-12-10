@@ -6,250 +6,266 @@
 
 ## **Overview**
 
-This project implements a **complete gas-meter monitoring system** using:
+This project implements a complete gas-meter monitoring + remote control system using:
 
-* **ESP32** with Hall sensor ? detects gas-meter magnetic pulses (0.01 m� per pulse)
-* **Raspberry Pi** ? logs data via MQTT into SQLite
-* **Python email listener** ? accepts commands via email (Yahoo IMAP)
-* **Plot engine** ? generates charts (48-hour, 30-day, or arbitrary date range)
-* **Email sender** ? returns plots or raw CSV automatically
+* **ESP32 DevKit-C** + **Hall sensor** → detects gas-meter magnetic pulses (0.01 m³ per pulse)
+* **Sunflower solar-LiPo charging board** → powers ESP32 via battery or USB 5 V
+* **Raspberry Pi** → logs MQTT events into SQLite
+* **Mosquitto MQTT broker**
+* **Python IMAP listener** → receives commands via Yahoo email
+* **Python plotting engine** → returns plots or raw data via SMTP email
 
-The system allows you to remotely request:
-
-* **Fresh usage plots via email**
-* **Raw meter data dumps**
-* **Remote reboot**
-* **Stop listener**
-* **Send internal logs**
-
-Everything is controlled entirely over email, making it extremely robust even when remote SSH is unavailable.
-
----
-
-## **System Architecture**
+This lets you remotely email commands like:
 
 ```
- ?????????????????      WiFi/MQTT       ?????????????????
- ?   ESP32 Meter  ?  ??????????????????  ? Raspberry Pi   ?
- ?  Pulse Sensor  ?                      ? MQTT Listener  ?
- ?????????????????                      ? SQLite Logging ?
-                                         ?????????????????
-                                                ?
-                     Email Commands             ?
-            ?????????????????????????????????????
-            ?
-??????????????????????????
-? Email Listener (IMAP)  ?
-? - Checks commands      ?
-? - Runs plots           ?
-? - Sends results via    ?
-?   Yahoo SMTP           ?
-??????????????????????????
-          ?
-          ?
-   Remote Control via Email
+plot last48
+plot last30
+plot 2025-01-01 2025-01-03
+rawdata 2025-01-01 2025-01-03
+sendlogs
+reboot
+stop
+```
+
+The entire system can be controlled from anywhere without SSH.
+
+---
+
+# **Hardware Architecture**
+
+## **1. ESP32 → Hall Sensor → Gas Meter**
+
+### **Hall Sensor Wiring**
+
+Typical A3144 or equivalent digital Hall effect:
+
+```
+          Gas Meter Magnet
+                ↓
+        ┌──────────────────┐
+        │   Hall Sensor    │
+        └──────────────────┘
+              |   |   |
+              |   |   └── GND → ESP32 GND
+              |   └────── VCC → 3.3V
+              └────────── OUT → GPIO (e.g., GPIO 27)
+```
+
+### **ESP32 Connections**
+
+```
+   ESP32 DevKit-C
+ ┌──────────────────────┐
+ │ 3V3  ----------------------------- Hall sensor VCC
+ │ GND  ----------------------------- Hall sensor GND
+ │ GPIO27  -------------------------- Hall sensor OUT (digital)
+ │ EN / RST…
+ │ USB-5V → programming only
+ └──────────────────────┘
+```
+
+The ESP32 uses **GPIO interrupt (falling edge)** to detect pulses.
+
+---
+
+## **2. ESP32 → Sunflower Solar Li-ion Charger**
+
+The Sunflower board manages:
+
+* **Solar input (optional)**
+* **Li-ion battery**
+* **5V USB input**
+* **5V / 3.3V regulated outputs**
+
+### Wiring
+
+```
+ Sunflower Board
+ ┌──────────────────────────┐
+ │ USB-5V IN  (optional)    │
+ │ SOLAR IN   (optional)    │
+ │ BAT+ / BAT–  → Li-ion    │
+ │ 5V OUT  --------------------------→ ESP32 VIN (or 5V pin)
+ │ 3.3V OUT -------------------------→ NOT USED (ESP32 uses onboard regulator)
+ │ GND OUT --------------------------→ ESP32 GND
+ └──────────────────────────┘
+```
+
+ESP32 should **not** be powered via the 3.3 V Sunflower output — let the ESP32 regulate from 5 V.
+
+---
+
+# **Full Hardware Schematic (ASCII)**
+
+```
+                     ┌──────────────────────┐
+                     │   Sunflower Board    │
+                     │  (Solar/LiPo/USB)    │
+                     └──────────────────────┘
+                               │5V OUT
+                               ▼
+                    ┌───────────────────────┐
+                    │        ESP32          │
+                    │   DevKit-C V4 (U.FL)  │
+                    ├───────────────────────┤
+                    │ VIN (5V) <────────────── Sunflower 5V
+                    │ GND <──────────────────── Sunflower GND
+                    │ GPIO27 <───── Hall OUT
+                    │ 3V3  ───────── Hall VCC
+                    │ GND  ───────── Hall GND
+                    └───────────────────────┘
+                               │
+                               │ WiFi MQTT JSON
+                               ▼
+     ┌─────────────────────────────────────────────────┐
+     │                  Raspberry Pi                   │
+     │  Mosquitto MQTT Broker + SQLite Logger          │
+     │  logs → mqtt_log.db                             │
+     └─────────────────────────────────────────────────┘
+                               │
+                         Email commands
+                               ▼
+              ┌────────────────────────────────┐
+              │ Python Email Listener (IMAP)   │
+              │ - Receives commands            │
+              │ - Runs plot/CSV exporters      │
+              │ - Sends results over SMTP      │
+              └────────────────────────────────┘
 ```
 
 ---
 
-## **ESP32 Firmware Logic (Summary)**
+# **MQTT (Mosquitto) Service**
 
-* GPIO interrupt catches **falling-edge** magnetic pulse.
-* Debounce handling filters noise.
-* Sensor wakes from deep sleep, stores pulse.
-* Sensor writes JSON every **bin_s (300s)** containing:
+Install Mosquitto:
 
-  ```json
-  { "counts": [0,1,0,2,...], "bin_s": 300 }
-  ```
-* JSON published to MQTT topic:
+```bash
+sudo apt install mosquitto mosquitto-clients
+sudo systemctl enable mosquitto
+sudo systemctl start mosquitto
+```
 
-  ```
-  metering/counts
-  ```
+ESP32 publishes JSON to:
+
+```
+topic: metering/counts
+payload:
+{
+  "bin_s": 300,
+  "counts": [0,1,0,2,...]
+}
+```
+
+Test subscription on the Pi:
+
+```bash
+mosquitto_sub -t metering/# -v
+```
 
 ---
 
-## **Raspberry Pi: MQTT ? SQLite Logger**
+# **SQLite Database**
 
-SQLite schema:
+Location:
+
+```
+/home/pi/mqtt_log.db
+```
+
+Schema:
 
 ```sql
 CREATE TABLE log (
-    timestamp REAL,
+    timestamp REAL,      -- float epoch seconds (UTC)
     topic TEXT,
-    message TEXT
+    message TEXT         -- JSON blob
 );
 ```
 
-Each MQTT payload is stored with:
+MQTT → SQLite logger inserts rows like:
 
-* UNIX epoch timestamp
-* topic (`metering/counts`)
-* raw JSON message
+```
+timestamp | metering/counts | {"bin_s":300,"counts":[0,1,0,...]}
+```
+
+Daily size stays small (<5MB/month).
 
 ---
 
-## **Email Listener (Command Processor)**
+# **Email Listener (IMAP Command Handler)**
 
-File: **email_listener.py**
-
-Runs automatically via systemd service:
+Service file:
 
 ```
-sudo systemctl enable email_listener.service
-sudo systemctl start  email_listener.service
+/etc/systemd/system/email_listener.service
 ```
 
-### **Supported Commands (send by email)**
+Runs:
 
-| Command                         | Meaning            |
-| ------------------------------- | ------------------ |
-| `plot last48`                   | Plot last 48 hours |
-| `plot last30`                   | Plot last 30 days  |
-| `plot YYYY-MM-DD YYYY-MM-DD`    | Plot date range    |
-| `rawdata YYYY-MM-DD YYYY-MM-DD` | Send CSV dump      |
-| `sendlogs`                      | Send listener logs |
-| `stop`                          | Stop the listener  |
-| `reboot`                        | Reboot the Pi      |
+```
+/home/pi/email_listener.py
+```
 
-Only emails from the **trusted sender** are accepted.
+Processes:
+
+* plot last48
+* plot last30
+* plot <date1> <date2>
+* rawdata <date1> <date2>
+* sendlogs
+* stop
+* reboot
+
+Only accepts commands when:
+
+* Subject = **GAS_COMMAND**
+* From trusted email address
 
 ---
 
-## **Plot Engine (gas_plot.py)**
+# **Plotting Engine**
 
-### **Plot Types**
+### Plot style:
 
-1. **Vertical bar-style lines (vlines)**
+* Each gas bin becomes a **vertical line** (vline)
+* No compression or bar-loss even for 30 days
+* Proper timezone handling (GMT+8)
 
-   * Smooth, high-density plotting
-   * No lost bars due to Matplotlib compression
-   * Good representation of low-frequency pilot-flame pulses
+### Adaptive tick spacing:
 
-2. **Adaptive Tick Logic**
-
-   * If range < **5 days**:
-
-     * Major ticks = **1 hour**
-     * Minor ticks = **15 minutes**
-   * If range ? **5 days**:
-
-     * Major ticks = **1 day**
-     * Minor ticks = **1 hour**
-
-3. **Axis Format**
-
-   * X-axis moves to exactly **y = 0**
-   * Tick font = **size 6**
-
-### **Plot Example**
-
-You receive a plot like this by email:
-
-* X-axis = exact timestamps
-* Y-axis = pulse count (0.01 m�)
-* Each event = vertical blue bar (alpha 0.6)
+| Range    | Major ticks | Minor ticks |
+| -------- | ----------- | ----------- |
+| < 5 days | 1 hour      | 15 minutes  |
+| ≥ 5 days | 1 day       | 1 hour      |
 
 ---
 
-## **Raw Data Export (CSV)**
-
-Email:
+# **Cron Automation**
 
 ```
-rawdata 2025-01-01 2025-01-03
-```
-
-Listener runs exporter:
-
-* Flattens each 300-second bin
-* Computes precise midpoint `dt_meas` for each pulse bin
-* Writes CSV:
-
-Columns:
-
-| dt_orig | dt_meas | count |
-| ------- | ------- | ----- |
-
----
-
-## **Cron Automation**
-
-Daily 7:00am auto-generated plot:
-
-```
-0 7 * * * /home/pi/gas_plot.py last48 >> /home/pi/gas_plot.log 2>&1
+0 7 * * *  /home/pi/gas_plot.py last48 >> /home/pi/gas_plot.log 2>&1
 ```
 
 ---
 
-## **Systemd Service**
+# **Troubleshooting**
 
-`/etc/systemd/system/email_listener.service`
+### Bars disappearing?
 
-```
-[Unit]
-Description=Email Listener for Gas Commands
-After=network.target
+Use vertical-line plotting.
+This README version fixes all Matplotlib compression issues.
 
-[Service]
-ExecStart=/usr/bin/python3 /home/pi/email_listener.py
-WorkingDirectory=/home/pi
-Restart=always
+### No IMAP connection?
 
-[Install]
-WantedBy=multi-user.target
-```
+Yahoo rate-limits; script retries automatically.
 
-Control:
+### No SMTP?
+
+Try again; script restarts WiFi on 3rd failure.
+
+### Log viewer:
 
 ```
-systemctl restart email_listener
-systemctl status  email_listener
-journalctl -u email_listener
+tail -f /home/pi/email_listener.log
 ```
 
----
-
-## **Troubleshooting**
-
-### **Listener not responding**
-
-* Check log:
-
-  ```
-  tail -f /home/pi/email_listener.log
-  ```
-
-### **Plots missing bars**
-
-* Ensure ESP32 is sending JSON with correct bin_s
-* Ensure SQLite is not corrupt:
-
-  ```
-  sqlite3 mqtt_log.db "SELECT COUNT(*) FROM log;"
-  ```
-
-### **Email commands not executing**
-
-* Subject **must** be `GAS_COMMAND`
-* Sender must match the **trusted sender**
-
-### **Yahoo IMAP flakiness**
-
-Common � listener already retries automatically.
-
----
-
-## **Future Enhancements**
-
-* Daily & hourly gas usage aggregation
-* Annotated pilot-flame pattern detection
-* Leak detection via abnormal baseline consumption
-* Combine electricity + gas on shared timeline
-* Push notifications
-
----
-
-If you want this README exported as a PDF, or want architectural diagrams, SVGs, or renderings, I can generate them.
