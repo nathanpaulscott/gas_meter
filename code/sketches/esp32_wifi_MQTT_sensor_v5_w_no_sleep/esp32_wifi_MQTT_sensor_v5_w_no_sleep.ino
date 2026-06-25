@@ -2,6 +2,7 @@
 #include <PubSubClient.h>
 #include "esp_timer.h"
 #include "esp_bt.h"
+#include "esp_system.h"
 
 #define SENSOR_PIN 34   // Hall sensor (10k external pull-up)
 

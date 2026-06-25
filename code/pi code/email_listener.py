@@ -177,20 +177,20 @@ def handle_command(body_text):
     cmd = tokens[0].lower()
 
     if cmd == "plot" and len(tokens) >= 2 and tokens[1].lower() == "last48":
-        command = "python3 /home/pi/gas_plot.py last48"
+        command = "python3 /home/pi/gas_plot_rate.py last48"
         debug(f"Executing: {command}")
         os.system(command)
         return
 
     if cmd == "plot" and len(tokens) >= 2 and tokens[1].lower() == "last30":
-        command = "python3 /home/pi/gas_plot.py last30"
+        command = "python3 /home/pi/gas_plot_rate.py last30"
         debug(f"Executing: {command}")
         os.system(command)
         return
 
     if cmd == "plot" and len(tokens) == 3:
         d1, d2 = tokens[1], tokens[2]
-        command = f"python3 /home/pi/gas_plot.py {d1} {d2}"
+        command = f"python3 /home/pi/gas_plot_rate.py {d1} {d2}"
         debug(f"Executing: {command}")
         os.system(command)
         return
