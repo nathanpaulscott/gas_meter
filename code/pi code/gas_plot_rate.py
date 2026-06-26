@@ -6,10 +6,17 @@ import sqlite3
 import json
 import os
 import time
-import math
-from bisect import bisect_left, bisect_right
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, List, Sequence, Tuple
+
+import numpy as np
+
+try:
+    from scipy.interpolate import UnivariateSpline
+except ImportError:
+    print("ERROR: scipy is required for smoothing spline plotting.")
+    print("Install on Raspberry Pi OS with: sudo apt install python3-scipy")
+    raise SystemExit(1)
 
 import matplotlib
 matplotlib.use("Agg")
@@ -42,11 +49,14 @@ LOCAL_TZ = timezone(timedelta(hours=8))  # Perth GMT+8
 MAX_RANGE_SEC = 31 * 86400
 PULSE_M3 = 0.01
 
-# Time-aware smoothing for the irregular pulse-derived flow-rate series.
-# These are deliberately conservative so the smoothed line keeps the same
-# shape as the raw inferred rate, with only the harsh edges softened.
-SMOOTH_SIGMA_S = 180.0     # 3-minute Gaussian width
-SMOOTH_RADIUS_S = 900.0    # only use neighbours within +/-15 minutes
+# Spline plot settings.
+# Raw pulse-derived rate samples are irregular. This code first resamples them
+# onto a regular time grid, then applies a smoothing spline to that regular
+# series. Smaller residual = follows raw line more closely. Larger residual =
+# smoother/flatter curve.
+RESAMPLE_GRID_S = 150.0       # 2.5 minute grid. Try 300.0 for 5 minutes.
+SPLINE_RESIDUAL_M3H = 0.025    # typical allowed residual per point, in m³/hour
+SPLINE_ORDER = 3              # cubic smoothing spline when enough points exist
 
 
 # ======================================================
@@ -140,7 +150,8 @@ def infer_pulse_times_in_bin(bin_start: float, bin_end: float, count: int) -> Li
     if width <= 0:
         return []
 
-    # Using sub-bin centers avoids placing pulses exactly on bin edges.
+    # Using sub-bin centres avoids placing pulses exactly on bin edges.
+    # count=1 gives the bin centre. count=N spreads N pulses evenly inside the bin.
     return [
         bin_start + ((idx + 0.5) * width / count)
         for idx in range(count)
@@ -175,6 +186,12 @@ def build_inferred_pulse_epochs(rows: Sequence[Tuple[float, str]]) -> List[float
 # ======================================================
 
 def build_rate_series(pulse_epochs: Sequence[float]) -> Tuple[List[datetime], List[float]]:
+    """
+    Convert inferred pulse timestamps into interval-rate samples.
+
+    Each pulse represents 0.01 m³. For each consecutive pulse pair, the gas
+    flow rate is assigned to the midpoint between those two pulses.
+    """
     rate_times: List[datetime] = []
     rate_vals: List[float] = []
 
@@ -194,52 +211,104 @@ def build_rate_series(pulse_epochs: Sequence[float]) -> Tuple[List[datetime], Li
     return rate_times, rate_vals
 
 
-def smooth_irregular_time_series(
+def resample_rate_series(
     rate_times: Sequence[datetime],
-    values: Sequence[float],
-    sigma_s: float = SMOOTH_SIGMA_S,
-    radius_s: float = SMOOTH_RADIUS_S,
-) -> List[float]:
+    rate_vals: Sequence[float],
+    grid_s: float = RESAMPLE_GRID_S,
+) -> Tuple[List[datetime], List[float]]:
     """
-    Smooth an irregularly-spaced time series using Gaussian weights in
-    real time, not by point count.
+    Resample the irregular midpoint rate samples onto a regular time grid.
 
-    This avoids the broken behaviour of an N-point moving average where
-    9 points may represent minutes during active use but hours during
-    quiet pilot-light use.
+    This uses simple linear interpolation. The regular grid then makes the
+    smoothing spline behaviour more predictable than fitting directly to a
+    highly irregular point sequence.
     """
-    if not rate_times or not values:
-        return []
+    if not rate_times or not rate_vals:
+        return [], []
 
-    if len(rate_times) != len(values):
-        raise ValueError("rate_times and values must have the same length")
+    if len(rate_times) != len(rate_vals):
+        raise ValueError("rate_times and rate_vals must have the same length")
 
-    if len(values) < 3 or sigma_s <= 0 or radius_s <= 0:
-        return list(values)
+    if len(rate_times) == 1:
+        return list(rate_times), list(rate_vals)
 
-    epochs = [t.timestamp() for t in rate_times]
-    vals = [float(v) for v in values]
-    smoothed: List[float] = []
+    epochs = np.array([t.timestamp() for t in rate_times], dtype=float)
+    vals = np.array(rate_vals, dtype=float)
 
-    for t in epochs:
-        left = bisect_left(epochs, t - radius_s)
-        right = bisect_right(epochs, t + radius_s)
+    # Remove duplicate timestamps by averaging their values. UnivariateSpline
+    # requires strictly increasing x values.
+    unique_epochs: List[float] = []
+    unique_vals: List[float] = []
 
-        weighted_sum = 0.0
-        weight_total = 0.0
+    i = 0
+    while i < len(epochs):
+        t = epochs[i]
+        same_vals = [vals[i]]
+        i += 1
+        while i < len(epochs) and epochs[i] == t:
+            same_vals.append(vals[i])
+            i += 1
+        unique_epochs.append(float(t))
+        unique_vals.append(float(np.mean(same_vals)))
 
-        for j in range(left, right):
-            dt_s = epochs[j] - t
-            weight = math.exp(-0.5 * (dt_s / sigma_s) ** 2)
-            weighted_sum += weight * vals[j]
-            weight_total += weight
+    epochs = np.array(unique_epochs, dtype=float)
+    vals = np.array(unique_vals, dtype=float)
 
-        if weight_total > 0:
-            smoothed.append(weighted_sum / weight_total)
-        else:
-            smoothed.append(vals[len(smoothed)])
+    if len(epochs) < 2:
+        return [datetime.fromtimestamp(float(epochs[0]), tz=LOCAL_TZ)], [float(vals[0])]
 
-    return smoothed
+    grid_epochs = np.arange(epochs[0], epochs[-1] + grid_s, grid_s, dtype=float)
+    grid_vals = np.interp(grid_epochs, epochs, vals)
+
+    grid_times = [datetime.fromtimestamp(float(t), tz=LOCAL_TZ) for t in grid_epochs]
+    return grid_times, [float(v) for v in grid_vals]
+
+
+def smoothing_spline_rate_series(
+    grid_times: Sequence[datetime],
+    grid_vals: Sequence[float],
+    residual_m3h: float = SPLINE_RESIDUAL_M3H,
+    spline_order: int = SPLINE_ORDER,
+) -> Tuple[List[datetime], List[float]]:
+    """
+    Apply a smoothing spline to a regular-grid gas flow-rate series.
+
+    residual_m3h controls the smoothing strength:
+      - smaller value: closer to raw/resampled data, less smoothing
+      - larger value: smoother curve, more deviation from raw/resampled data
+
+    Negative rates are clipped to zero because negative gas flow is not physical.
+    """
+    if not grid_times or not grid_vals:
+        return [], []
+
+    if len(grid_times) != len(grid_vals):
+        raise ValueError("grid_times and grid_vals must have the same length")
+
+    n = len(grid_vals)
+    if n < 4:
+        return list(grid_times), list(grid_vals)
+
+    epochs = np.array([t.timestamp() for t in grid_times], dtype=float)
+    y = np.array(grid_vals, dtype=float)
+
+    # Use hours from the first sample to keep x values numerically small.
+    x_hours = (epochs - epochs[0]) / 3600.0
+
+    # Smoothing parameter s is the allowed sum of squared residuals.
+    # Using n * residual^2 makes the knob intuitive in m³/hour units.
+    residual_m3h = max(float(residual_m3h), 0.0)
+    s = n * (residual_m3h ** 2)
+
+    k = min(int(spline_order), n - 1)
+    spline = UnivariateSpline(x_hours, y, k=k, s=s)
+    y_smooth = spline(x_hours)
+
+    # Gas flow cannot be negative. Spline overshoot can otherwise create
+    # small negative dips around sharp transitions.
+    y_smooth = np.maximum(y_smooth, 0.0)
+
+    return list(grid_times), [float(v) for v in y_smooth]
 
 
 # ======================================================
@@ -273,32 +342,45 @@ def plot_rate_series(
     fig, ax = plt.subplots(figsize=(14, 5))
 
     if rate_times and rate_vals:
-        smooth_vals = smooth_irregular_time_series(rate_times, rate_vals)
+        grid_times, grid_vals = resample_rate_series(rate_times, rate_vals)
+        spline_times, spline_vals = smoothing_spline_rate_series(grid_times, grid_vals)
 
-        # Raw inferred rate: keep it visible as a reference, but visually quiet.
+        # Raw inferred rate: visible as reference, but visually quiet.
         ax.plot(
             rate_times,
             rate_vals,
             linestyle=":",
             linewidth=0.8,
-            alpha=0.50,
+            alpha=0.35,
             color="blue",
             label="Raw inferred rate",
         )
 
-        # Main visual line: time-aware smoothing, not point-count moving average.
+        # Optional resampled reference. Kept very faint so it does not dominate.
         ax.plot(
-            rate_times,
-            smooth_vals,
-            linewidth=1.2,
-            alpha=0.95,
-            color="red",
-            label=f"Smoothed rate ({SMOOTH_SIGMA_S / 60:.0f} min Gaussian)",
+            grid_times,
+            grid_vals,
+            linestyle="--",
+            linewidth=0.7,
+            alpha=0.20,
+            color="gray",
+            label=f"Resampled {RESAMPLE_GRID_S / 60:.1f} min grid",
         )
 
-        max_y = max(max(rate_vals), max(smooth_vals))
+        # Main visual line: smoothing spline on the regular-grid rate series.
+        ax.plot(
+            spline_times,
+            spline_vals,
+            linewidth=1.5,
+            alpha=0.95,
+            color="red",
+            label=f"Smoothing spline, residual {SPLINE_RESIDUAL_M3H:.2f} m³/h",
+        )
+
+        max_y = max(max(rate_vals), max(grid_vals), max(spline_vals))
         ymax = max_y * 1.10 if max_y > 0 else 1.0
         ax.set_ylim(bottom=0, top=ymax)
+        ax.set_xlim(left=start_dt, right=end_dt)
     else:
         ax.text(
             0.5,
@@ -309,6 +391,7 @@ def plot_rate_series(
             transform=ax.transAxes,
         )
         ax.set_ylim(bottom=0, top=1)
+        ax.set_xlim(left=start_dt, right=end_dt)
 
     total_days = max((end_dt.timestamp() - start_dt.timestamp()) / 86400.0, 1e-9)
     configure_time_axis(ax, total_days)
@@ -403,6 +486,8 @@ def main() -> None:
         f"\nRange: {start_dt.strftime('%Y-%m-%d %H:%M')} → {end_dt.strftime('%Y-%m-%d %H:%M')}"
         f"\nTotal usage: {total_gas_m3:.2f} m³"
         f"\nPulses: {total_pulses}"
+        f"\nResample grid: {RESAMPLE_GRID_S / 60:.1f} minutes"
+        f"\nSmoothing spline residual: {SPLINE_RESIDUAL_M3H:.2f} m³/hour"
         "\nPulse timing within each bin is inferred by even spacing."
         "\n(trimmed to 31 days if applicable)\n"
     )
