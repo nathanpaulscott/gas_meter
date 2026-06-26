@@ -321,7 +321,7 @@ Output file:
 /home/pi/gas_plot_rate.png
 ```
 
-The flow-rate plot converts pulse counts into an inferred gas flow-rate time series.
+The flow-rate plot converts binned pulse counts into an inferred gas flow-rate time series.
 
 Processing strategy:
 
@@ -329,7 +329,9 @@ Processing strategy:
 raw DB bin counts
 → inferred individual pulse timestamps
 → interval-based flow-rate points
-→ time-aware smoothed line plot
+→ regular-grid resampling
+→ smoothing spline
+→ flow-rate line plot
 ```
 
 Detailed logic:
@@ -350,22 +352,70 @@ rate_m3_per_hour = 0.01 × 3600 / dt_s
 rate_timestamp = midpoint(t_prev, t_now)
 ```
 
-5. Plot:
-   - raw inferred rate as a faint dotted line
-   - smoothed rate as the main red line
+5. Resample the interval-rate series onto a regular time grid.
+6. Fit a smoothing spline to the regular-grid rate series.
+7. Plot:
+   - raw inferred rate as a faint dotted reference line
+   - spline-smoothed rate as the main red line
 
-Smoothing is **time-aware**, not a fixed N-point moving average. This matters because the rate points are irregularly spaced in time. A fixed 9-point moving average is wrong here because 9 points can cover minutes during active usage but many hours during quiet pilot-light usage.
+This replaced the earlier Gaussian time-window smoothing. It also avoids the older fixed N-point moving-average problem, where the same number of points could represent minutes during active gas use but many hours during quiet pilot-light use.
 
-Typical smoothing constants in `gas_plot_rate.py`:
+## Spline smoothing settings
+
+Current smoothing parameters in `gas_plot_rate.py`:
 
 ```python
-SMOOTH_SIGMA_S = 120.0   # 2-minute Gaussian width
-SMOOTH_RADIUS_S = 600.0  # +/-10 minute search radius
+RESAMPLE_GRID_S = 150.0       # 2.5-minute regular grid
+SPLINE_RESIDUAL_M3H = 0.025   # lower = less smooth / closer to raw
+SPLINE_ORDER = 3              # cubic smoothing spline
 ```
 
-Lower values make the plot sharper; higher values smooth more aggressively.
+Tuning guide:
 
-### Flow-rate interpretation
+```text
+SPLINE_RESIDUAL_M3H lower  → less smoothing, closer to raw rate shape
+SPLINE_RESIDUAL_M3H higher → more smoothing, softer curve
+RESAMPLE_GRID_S = 150      → 2.5-minute grid, current preferred setting
+RESAMPLE_GRID_S = 300      → 5-minute grid, simpler/coarser plot
+```
+
+The current preferred value is:
+
+```python
+SPLINE_RESIDUAL_M3H = 0.025
+```
+
+This gives a smooth curve while still following the gas-use events closely.
+
+## Python dependency
+
+The spline plotter requires SciPy:
+
+```bash
+sudo apt install python3-scipy
+```
+
+On older Raspberry Pi OS / Raspbian Buster systems, the normal Raspbian package mirror may no longer contain Buster packages. If `apt update` gives Buster 404 errors, update `/etc/apt/sources.list` from:
+
+```text
+http://raspbian.raspberrypi.org/raspbian/
+```
+
+to:
+
+```text
+http://legacy.raspbian.org/raspbian/
+```
+
+Then run:
+
+```bash
+sudo apt clean
+sudo apt update
+sudo apt install python3-scipy
+```
+
+## Flow-rate interpretation
 
 Examples:
 
@@ -377,11 +427,17 @@ Examples:
 0.05 m³ / (5/60 hour) = 0.6 m³/h
 ```
 
-### Plot limitation
+## Plot limitations
 
-The database stores **counts per bin**, not exact pulse timestamps. When a bin has multiple pulses, the exact timing inside that bin is lost. The plot therefore uses evenly spaced inferred timestamps inside each bin. This is good for visual flow-rate estimation but is not exact sub-bin timing.
+The database stores **counts per bin**, not exact pulse timestamps. When a bin has multiple pulses, the exact timing inside that bin is lost. The plot therefore uses evenly spaced inferred timestamps inside each bin.
 
-### Plot axis behaviour
+The spline-smoothed line is for visual interpretation only. It should not be used as the source of truth for total gas usage. Total gas usage should always come from raw pulse count:
+
+```text
+total_gas_m3 = total_pulses × 0.01
+```
+
+## Plot axis behaviour
 
 The rate plot uses adaptive time ticks:
 
@@ -390,7 +446,6 @@ The rate plot uses adaptive time ticks:
 | Up to 2 days | 1 hour | 15 minutes |
 | 2 to 5 days | 2 hours | 30 minutes |
 | More than 5 days | 6 hours | 1 hour |
-
 
 ---
 
@@ -485,8 +540,11 @@ Most likely causes:
 Check:
 
 - The script is using `gas_plot_rate.py`, not the old raw-bin plot script.
-- The plot smoothing is time-aware Gaussian smoothing, not a point-count moving average.
-- `SMOOTH_SIGMA_S` and `SMOOTH_RADIUS_S` are not too large.
+- SciPy is installed and importable with `python3 -c "import scipy; print(scipy.__version__)"`.
+- The plot is using regular-grid resampling plus smoothing spline, not the older Gaussian smoother and not a fixed N-point moving average.
+- `SPLINE_RESIDUAL_M3H` is not too high. Higher values smooth more aggressively.
+- Current preferred setting is `SPLINE_RESIDUAL_M3H = 0.025`.
+- `RESAMPLE_GRID_S` is set to `150.0` for the current 2.5-minute grid, or `300.0` if a coarser 5-minute grid is wanted.
 - Raw total gas usage still matches `pulse_count × 0.01`.
 
 ## No IMAP connection
