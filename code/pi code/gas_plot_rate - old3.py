@@ -7,7 +7,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
 
@@ -47,13 +47,8 @@ PULSE_M3 = 0.01
 # onto a regular time grid, then smooths that regular series using a centered
 # exponential-weighted average. The smoother uses past and future samples.
 RESAMPLE_GRID_S = 150.0       # 2.5 minute grid. Try 300.0 for a calmer curve.
-CENTERED_EMA_RADIUS = 8       # 8 before + current + 8 after = 17 samples.
+CENTERED_EMA_RADIUS = 8     # 10 before + current + 10 after = 21 samples.
 CENTERED_EMA_DECAY = 3.0      # lower = more local; higher = flatter/smoother.
-
-# Blue underlay mode.
-#   "pulses"   = original raw DB pulse-count bins on a right-side y-axis
-#   "raw_rate" = unsmoothed derived flow-rate grid on the main y-axis
-UNDERLAY_MODE = "pulses"
 
 
 # ======================================================
@@ -352,7 +347,7 @@ def centered_exponential_average(
 
 def configure_time_axis(ax: plt.Axes, total_days: float) -> None:
     # This is intentionally the same locator/formatter logic as the old
-    # working single-axis plot.
+    # working single-axis spline plot.
     if total_days <= 2:
         ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
         ax.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=[0, 15, 30, 45]))
@@ -367,30 +362,34 @@ def configure_time_axis(ax: plt.Axes, total_days: float) -> None:
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M", tz=LOCAL_TZ))
 
 
-def style_xaxis_like_old_plot(
-    fig: plt.Figure,
-    ax_rate: plt.Axes,
-    ax_secondary: Optional[plt.Axes] = None,
-) -> None:
+def style_xaxis_like_old_plot(fig: plt.Figure, ax_rate: plt.Axes, ax_pulse: plt.Axes) -> None:
     """
     Force the bottom x-axis to behave like the old working plot.
 
-    If a secondary axis exists for the raw pulse-count underlay, it must not
-    own or draw x-axis labels. The primary rate axis always owns the vertical
-    date labels.
-    """
-    if ax_secondary is not None:
-        ax_secondary.tick_params(
-            axis="x",
-            which="both",
-            bottom=False,
-            top=False,
-            labelbottom=False,
-            labeltop=False,
-        )
+    The old plot used a single axis and then:
+        plt.xticks(rotation=90, fontsize=6)
 
+    After adding twinx() for the raw pulse-count underlay, pyplot can target
+    the secondary axis and Matplotlib may auto-generate dense date labels.
+    This function makes the primary rate axis the only visible x-label owner
+    and applies the same vertical label style explicitly.
+    """
+    # Secondary axis is only for the right-side pulse-count scale.
+    # It must not own, draw, or auto-format any x-axis labels.
+    ax_pulse.tick_params(
+        axis="x",
+        which="both",
+        bottom=False,
+        top=False,
+        labelbottom=False,
+        labeltop=False,
+    )
+
+    # Primary axis owns the x-axis labels, using the old vertical style.
     ax_rate.tick_params(axis="x", which="major", labelrotation=90, labelsize=6, labelbottom=True)
 
+    # Force-create the tick labels now and set exact text properties.
+    # This avoids pyplot/current-axis ambiguity caused by twinx().
     fig.canvas.draw()
     for label in ax_rate.get_xticklabels(which="major"):
         label.set_rotation(90)
@@ -400,28 +399,21 @@ def style_xaxis_like_old_plot(
         label.set_visible(True)
 
 
-def underlay_description() -> str:
-    mode = UNDERLAY_MODE.lower().strip()
-    if mode == "pulses":
-        return "raw gas-pulse counts per bin"
-    if mode == "raw_rate":
-        return "unsmoothed resampled flow-rate grid"
-    return f"unknown UNDERLAY_MODE={UNDERLAY_MODE!r}"
-
-
-def plot_pulse_count_underlay(
-    ax_rate: plt.Axes,
+def plot_rate_series(
+    rate_times: Sequence[datetime],
+    rate_vals: Sequence[float],
     raw_bin_times: Sequence[datetime],
     raw_bin_counts: Sequence[int],
     start_dt: datetime,
     end_dt: datetime,
-) -> plt.Axes:
-    """
-    Plot the original DB pulse-count bins as a blue underlay on a secondary
-    right-side y-axis.
+    total_gas_m3: float,
+    total_pulses: int,
+    output_file: str,
+) -> None:
+    fig, ax_rate = plt.subplots(figsize=(14, 5))
 
-    This is the original raw data view: count per bin, not derived flow rate.
-    """
+    # Secondary axis for the original gas-pulse bin counts.
+    # These are the raw DB values: count per bin, not derived flow rate.
     ax_pulse = ax_rate.twinx()
     ax_pulse.set_zorder(1)
     ax_rate.set_zorder(2)
@@ -445,74 +437,14 @@ def plot_pulse_count_underlay(
 
         max_pulse_count = max(raw_bin_counts) if raw_bin_counts else 0
         ax_pulse.set_ylim(bottom=0, top=max(max_pulse_count * 1.15, 1.0))
+        ax_pulse.set_ylabel("Raw pulse count per bin")
     else:
         ax_pulse.set_ylim(bottom=0, top=1)
-
-    ax_pulse.set_ylabel("Raw pulse count per bin")
-    ax_pulse.set_xlim(left=start_dt, right=end_dt)
-    return ax_pulse
-
-
-def plot_unsmoothed_rate_underlay(
-    ax_rate: plt.Axes,
-    grid_times: Sequence[datetime],
-    grid_vals: Sequence[float],
-) -> None:
-    """
-    Plot the unsmoothed derived flow-rate grid as a blue underlay on the main
-    flow-rate y-axis.
-
-    This is not the raw DB count data. It is the regular-grid rate series before
-    the centered EMA is applied.
-    """
-    if not grid_times or not grid_vals:
-        return
-
-    ax_rate.plot(
-        grid_times,
-        grid_vals,
-        linestyle="-",
-        linewidth=0.8,
-        alpha=0.30,
-        color="blue",
-        label="Unsmoothed rate grid",
-    )
-
-
-def plot_rate_series(
-    rate_times: Sequence[datetime],
-    rate_vals: Sequence[float],
-    raw_bin_times: Sequence[datetime],
-    raw_bin_counts: Sequence[int],
-    start_dt: datetime,
-    end_dt: datetime,
-    total_gas_m3: float,
-    total_pulses: int,
-    output_file: str,
-) -> None:
-    fig, ax_rate = plt.subplots(figsize=(14, 5))
-
-    mode = UNDERLAY_MODE.lower().strip()
-    if mode not in {"pulses", "raw_rate"}:
-        raise ValueError('UNDERLAY_MODE must be "pulses" or "raw_rate"')
-
-    ax_secondary: Optional[plt.Axes] = None
-
-    if mode == "pulses":
-        ax_secondary = plot_pulse_count_underlay(
-            ax_rate=ax_rate,
-            raw_bin_times=raw_bin_times,
-            raw_bin_counts=raw_bin_counts,
-            start_dt=start_dt,
-            end_dt=end_dt,
-        )
+        ax_pulse.set_ylabel("Raw pulse count per bin")
 
     if rate_times and rate_vals:
         grid_times, grid_vals = resample_rate_series(rate_times, rate_vals)
         smooth_times, smooth_vals = centered_exponential_average(grid_times, grid_vals)
-
-        if mode == "raw_rate":
-            plot_unsmoothed_rate_underlay(ax_rate, grid_times, grid_vals)
 
         # Main visual line: centered exponential average on the regular-grid rate series.
         ax_rate.plot(
@@ -552,18 +484,13 @@ def plot_rate_series(
     )
 
     handles_rate, labels_rate = ax_rate.get_legend_handles_labels()
-    if ax_secondary is not None:
-        handles_secondary, labels_secondary = ax_secondary.get_legend_handles_labels()
-        handles = handles_rate + handles_secondary
-        labels = labels_rate + labels_secondary
-    else:
-        handles = handles_rate
-        labels = labels_rate
-
+    handles_pulse, labels_pulse = ax_pulse.get_legend_handles_labels()
+    handles = handles_rate + handles_pulse
+    labels = labels_rate + labels_pulse
     if handles:
         ax_rate.legend(handles, labels, loc="upper right")
 
-    style_xaxis_like_old_plot(fig, ax_rate, ax_secondary)
+    style_xaxis_like_old_plot(fig, ax_rate, ax_pulse)
     plt.sca(ax_rate)
     plt.tight_layout()
     plt.savefig(output_file)
@@ -649,7 +576,7 @@ def main() -> None:
         f"\nResample grid: {RESAMPLE_GRID_S / 60:.1f} minutes"
         f"\nCentered EMA radius: ±{CENTERED_EMA_RADIUS} samples"
         f"\nCentered EMA decay: {CENTERED_EMA_DECAY:.1f}"
-        f"\nUnderlay: {underlay_description()}"
+        "\nUnderlay: raw gas-pulse counts per bin"
         "\nPulse timing within each bin is inferred by even spacing."
         "\n(trimmed to 31 days if applicable)\n"
     )
