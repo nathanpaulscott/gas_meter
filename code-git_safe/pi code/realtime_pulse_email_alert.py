@@ -7,12 +7,13 @@ import os
 import json
 
 
-'instructions:'
-'------------------------------
-'you need to manually run this when you have the esp32 in realtime puslse sending mode'
-'Then this will trigger an email for each pulse recieved, so you get more up to date info'
-'python3 /home/pi/gasmon/realtime_pulse_email_alert.py'
-
+'''
+instructions:
+------------------------------
+you need to manually run this when you have the esp32 in realtime puslse sending mode
+Then this will trigger an email for each pulse recieved, so you get more up to date info
+python3 /home/pi/gasmon/realtime_pulse_email_alert.py
+'''
 
 # ============================
 # CONFIG
