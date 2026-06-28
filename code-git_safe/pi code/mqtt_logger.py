@@ -2,7 +2,7 @@
 import paho.mqtt.client as mqtt
 import sqlite3, time, os
 
-DB_PATH = "/home/pi/mqtt_log.db"
+DB_PATH = "/home/pi/gasmon/mqtt_log.db"
 
 # ensure DB exists
 conn = sqlite3.connect(DB_PATH)

@@ -9,7 +9,7 @@ from datetime import datetime
 DEBUG = True
 
 EMAIL_ACCOUNT  = "nathanpaulscott@yahoo.com"
-PASSWORD_FILE  = "/home/pi/surf_data/yp.sec"
+PASSWORD_FILE  = "/home/pi/gasmon/yp.sec"
 IMAP_SERVER    = "imap.mail.yahoo.com"
 IMAP_PORT      = 993
 
@@ -19,8 +19,8 @@ COMMAND_SUBJECT  = "GAS_COMMAND"
 POLL_SECONDS = 3600
 
 # Log files (capped)
-LOG_FILE = "/home/pi/email_listener.log"
-ERR_FILE = "/home/pi/email_listener.err"
+LOG_FILE = "/home/pi/gasmon/email_listener.log"
+ERR_FILE = "/home/pi/gasmon/email_listener.err"
 MAX_LINES = 100  # cap log length
 
 
@@ -177,20 +177,20 @@ def handle_command(body_text):
     cmd = tokens[0].lower()
 
     if cmd == "plot" and len(tokens) >= 2 and tokens[1].lower() == "last48":
-        command = "python3 /home/pi/gas_plot_rate.py last48"
+        command = "python3 /home/pi/gasmon/gas_plot_rate.py last48"
         debug(f"Executing: {command}")
         os.system(command)
         return
 
     if cmd == "plot" and len(tokens) >= 2 and tokens[1].lower() == "last30":
-        command = "python3 /home/pi/gas_plot_rate.py last30"
+        command = "python3 /home/pi/gasmon/gas_plot_rate.py last30"
         debug(f"Executing: {command}")
         os.system(command)
         return
 
     if cmd == "plot" and len(tokens) == 3:
         d1, d2 = tokens[1], tokens[2]
-        command = f"python3 /home/pi/gas_plot_rate.py {d1} {d2}"
+        command = f"python3 /home/pi/gasmon/gas_plot_rate.py {d1} {d2}"
         debug(f"Executing: {command}")
         os.system(command)
         return
@@ -198,7 +198,7 @@ def handle_command(body_text):
     # ========= rawdata (new feature) =========
     if cmd == "rawdata" and len(tokens) == 3:
         d1, d2 = tokens[1], tokens[2]
-        command = f"python3 /home/pi/rawdata_dump.py {d1} {d2}"
+        command = f"python3 /home/pi/gasmon/rawdata_dump.py {d1} {d2}"
         debug(f"Executing: {command}")
         os.system(command)
         return
@@ -214,7 +214,7 @@ def handle_command(body_text):
 
     if cmd == "sendlogs":
         debug("Sending logs to user...")
-        os.system("python3 /home/pi/send_logs.py")
+        os.system("python3 /home/pi/gasmon/send_logs.py")
         return
 
     err("UNKNOWN COMMAND FORMAT")

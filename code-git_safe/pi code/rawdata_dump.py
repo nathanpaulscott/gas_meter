@@ -8,15 +8,15 @@ import email
 import os
 import time
 
-DB_PATH = "/home/pi/mqtt_log.db"
+DB_PATH = "/home/pi/gasmon/mqtt_log.db"
 TOPIC   = "metering/counts"
-CSV_FILE = "/home/pi/rawdata.csv"
+CSV_FILE = "/home/pi/gasmon/rawdata.csv"
 
 EMAIL_TO      = "nathan.scott.rf@gmail.com"
 EMAIL_ACCOUNT = "nathanpaulscott@yahoo.com"
 SMTP_SERVER   = "smtp.mail.yahoo.com"
 SMTP_PORT     = 465
-PASSWORD_FILE = "/home/pi/surf_data/yp.sec"
+PASSWORD_FILE = "/home/pi/gasmon/yp.sec"
 
 with open(PASSWORD_FILE, "r") as f:
     EMAIL_PASSWORD = f.read().strip()

@@ -44,7 +44,7 @@ const char* MQTT_PULSE_TOPIC = "metering/debug/pulse";
 // WIFI / MQTT CONFIG
 // =====================
 const char* ssid        = "base2.4";
-const char* password    = "samarajames";
+const char* password    = "x";    //this is for git
 const char* mqtt_server = "192.168.0.110";
 const int   mqtt_port   = 1883;
 const char* device_id   = "esp32_gas1";

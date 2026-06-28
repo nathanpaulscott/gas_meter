@@ -11,7 +11,7 @@ import json
 '------------------------------
 'you need to manually run this when you have the esp32 in realtime puslse sending mode'
 'Then this will trigger an email for each pulse recieved, so you get more up to date info'
-'python3 /home/pi/realtime_pulse_email_alert.py'
+'python3 /home/pi/gasmon/realtime_pulse_email_alert.py'
 
 
 # ============================
@@ -25,7 +25,7 @@ EMAIL_ACCOUNT = "nathanpaulscott@yahoo.com"
 SMTP_SERVER   = "smtp.mail.yahoo.com"
 SMTP_PORT     = 465
 
-PASSWORD_FILE = "/home/pi/surf_data/yp.sec"
+PASSWORD_FILE = "/home/pi/gasmon/yp.sec"
 
 with open(PASSWORD_FILE) as f:
     EMAIL_PASSWORD = f.read().strip()

@@ -7,16 +7,9 @@ import json
 import os
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-
-try:
-    from scipy.interpolate import UnivariateSpline
-except ImportError:
-    print("ERROR: scipy is required for smoothing spline plotting.")
-    print("Install on Raspberry Pi OS with: sudo apt install python3-scipy")
-    raise SystemExit(1)
 
 import matplotlib
 matplotlib.use("Agg")
@@ -31,32 +24,38 @@ import email
 # CONFIGURATION
 # ======================================================
 
-DB_PATH = "/home/pi/mqtt_log.db"
+DB_PATH = "/home/pi/gasmon/mqtt_log.db"
 TOPIC = "metering/counts"
-PNG_FILE = "/home/pi/gas_plot_rate.png"
+PNG_FILE = "/home/pi/gasmon/gas_plot_rate.png"
 
 EMAIL_TO = "nathan.scott.rf@gmail.com"
 EMAIL_ACCOUNT = "nathanpaulscott@yahoo.com"
 SMTP_SERVER = "smtp.mail.yahoo.com"
 SMTP_PORT = 465
 
-PASSWORD_FILE = "/home/pi/surf_data/yp.sec"
-
+#passwords are stored locally only...
+###########################################
+PASSWORD_FILE = "/home/pi/gasmon/yp.sec"
 with open(PASSWORD_FILE, "r", encoding="utf-8") as f:
     EMAIL_PASSWORD = f.read().strip()
+###########################################
 
 LOCAL_TZ = timezone(timedelta(hours=8))  # Perth GMT+8
 MAX_RANGE_SEC = 31 * 86400
 PULSE_M3 = 0.01
 
-# Spline plot settings.
+# Centered exponential moving-average settings.
 # Raw pulse-derived rate samples are irregular. This code first resamples them
-# onto a regular time grid, then applies a smoothing spline to that regular
-# series. Smaller residual = follows raw line more closely. Larger residual =
-# smoother/flatter curve.
-RESAMPLE_GRID_S = 150.0       # 2.5 minute grid. Try 300.0 for 5 minutes.
-SPLINE_RESIDUAL_M3H = 0.025    # typical allowed residual per point, in m³/hour
-SPLINE_ORDER = 3              # cubic smoothing spline when enough points exist
+# onto a regular time grid, then smooths that regular series using a centered
+# exponential-weighted average. The smoother uses past and future samples.
+RESAMPLE_GRID_S = 100.0       # 2 minute grid. Try 300.0 for a calmer curve.
+CENTERED_EMA_RADIUS = 8       # 8 before + current + 8 after = 17 samples.
+CENTERED_EMA_DECAY = 2.0      # lower = more local; higher = flatter/smoother.
+
+# Blue underlay mode.
+#   "pulses"   = original raw DB pulse-count bins on a right-side y-axis
+#   "raw_rate" = unsmoothed derived flow-rate grid on the main y-axis
+UNDERLAY_MODE = "pulses"
 
 
 # ======================================================
@@ -181,6 +180,43 @@ def build_inferred_pulse_epochs(rows: Sequence[Tuple[float, str]]) -> List[float
     return pulse_epochs
 
 
+def build_raw_bin_count_series(rows: Sequence[Tuple[float, str]]) -> Tuple[List[datetime], List[int]]:
+    """
+    Build the original raw gas-pulse bin-count series for underlay plotting.
+
+    This is the direct DB/bin-count view: one timestamp per bin midpoint and
+    one value equal to the number of pulses detected in that bin. It is kept
+    separate from the derived flow-rate series because the units are different.
+    """
+    bin_times: List[datetime] = []
+    bin_counts: List[int] = []
+
+    for row_end_epoch, msg_json in rows:
+        try:
+            data = json.loads(msg_json)
+            counts = data["counts"]
+            bin_s = float(data["bin_s"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Skipping bad row at {row_end_epoch}: {exc}")
+            continue
+
+        if not isinstance(counts, list) or bin_s <= 0:
+            print(f"Skipping malformed row at {row_end_epoch}")
+            continue
+
+        for bin_start, bin_end, count in iter_bin_windows(row_end_epoch, counts, bin_s):
+            midpoint_epoch = bin_start + (bin_end - bin_start) / 2.0
+            bin_times.append(datetime.fromtimestamp(midpoint_epoch, tz=LOCAL_TZ))
+            bin_counts.append(int(count))
+
+    pairs = sorted(zip(bin_times, bin_counts))
+    if not pairs:
+        return [], []
+
+    times, counts = zip(*pairs)
+    return list(times), list(counts)
+
+
 # ======================================================
 # RATE DERIVATION
 # ======================================================
@@ -220,7 +256,7 @@ def resample_rate_series(
     Resample the irregular midpoint rate samples onto a regular time grid.
 
     This uses simple linear interpolation. The regular grid then makes the
-    smoothing spline behaviour more predictable than fitting directly to a
+    centered smoother behaviour more predictable than fitting directly to a
     highly irregular point sequence.
     """
     if not rate_times or not rate_vals:
@@ -235,8 +271,7 @@ def resample_rate_series(
     epochs = np.array([t.timestamp() for t in rate_times], dtype=float)
     vals = np.array(rate_vals, dtype=float)
 
-    # Remove duplicate timestamps by averaging their values. UnivariateSpline
-    # requires strictly increasing x values.
+    # Remove duplicate timestamps by averaging their values.
     unique_epochs: List[float] = []
     unique_vals: List[float] = []
 
@@ -264,20 +299,18 @@ def resample_rate_series(
     return grid_times, [float(v) for v in grid_vals]
 
 
-def smoothing_spline_rate_series(
+def centered_exponential_average(
     grid_times: Sequence[datetime],
     grid_vals: Sequence[float],
-    residual_m3h: float = SPLINE_RESIDUAL_M3H,
-    spline_order: int = SPLINE_ORDER,
+    radius: int = CENTERED_EMA_RADIUS,
+    decay: float = CENTERED_EMA_DECAY,
 ) -> Tuple[List[datetime], List[float]]:
     """
-    Apply a smoothing spline to a regular-grid gas flow-rate series.
+    Smooth a regular-grid gas flow-rate series using a centered exponential
+    weighted average.
 
-    residual_m3h controls the smoothing strength:
-      - smaller value: closer to raw/resampled data, less smoothing
-      - larger value: smoother curve, more deviation from raw/resampled data
-
-    Negative rates are clipped to zero because negative gas flow is not physical.
+    For each point, the smoother looks both backward and forward by `radius`
+    samples. Nearby samples receive more weight than distant samples.
     """
     if not grid_times or not grid_vals:
         return [], []
@@ -285,30 +318,34 @@ def smoothing_spline_rate_series(
     if len(grid_times) != len(grid_vals):
         raise ValueError("grid_times and grid_vals must have the same length")
 
-    n = len(grid_vals)
-    if n < 4:
-        return list(grid_times), list(grid_vals)
-
-    epochs = np.array([t.timestamp() for t in grid_times], dtype=float)
     y = np.array(grid_vals, dtype=float)
+    n = len(y)
 
-    # Use hours from the first sample to keep x values numerically small.
-    x_hours = (epochs - epochs[0]) / 3600.0
+    if n < 3:
+        return list(grid_times), [float(v) for v in y]
 
-    # Smoothing parameter s is the allowed sum of squared residuals.
-    # Using n * residual^2 makes the knob intuitive in m³/hour units.
-    residual_m3h = max(float(residual_m3h), 0.0)
-    s = n * (residual_m3h ** 2)
+    radius = max(1, int(radius))
+    decay = max(float(decay), 1e-9)
 
-    k = min(int(spline_order), n - 1)
-    spline = UnivariateSpline(x_hours, y, k=k, s=s)
-    y_smooth = spline(x_hours)
+    offsets = np.arange(-radius, radius + 1, dtype=float)
+    weights_full = np.exp(-np.abs(offsets) / decay)
 
-    # Gas flow cannot be negative. Spline overshoot can otherwise create
-    # small negative dips around sharp transitions.
-    y_smooth = np.maximum(y_smooth, 0.0)
+    smooth = np.empty_like(y)
 
-    return list(grid_times), [float(v) for v in y_smooth]
+    for i in range(n):
+        left = max(0, i - radius)
+        right = min(n, i + radius + 1)
+
+        # Slice the full symmetric weight vector to match the truncated data
+        # window at the start/end of the series.
+        w_left = radius - (i - left)
+        w_right = radius + (right - i)
+        weights = weights_full[w_left:w_right]
+        vals = y[left:right]
+
+        smooth[i] = float(np.sum(weights * vals) / np.sum(weights))
+
+    return list(grid_times), [float(v) for v in smooth]
 
 
 # ======================================================
@@ -316,6 +353,8 @@ def smoothing_spline_rate_series(
 # ======================================================
 
 def configure_time_axis(ax: plt.Axes, total_days: float) -> None:
+    # This is intentionally the same locator/formatter logic as the old
+    # working single-axis plot.
     if total_days <= 2:
         ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
         ax.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=[0, 15, 30, 45]))
@@ -330,84 +369,204 @@ def configure_time_axis(ax: plt.Axes, total_days: float) -> None:
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M", tz=LOCAL_TZ))
 
 
+def style_xaxis_like_old_plot(
+    fig: plt.Figure,
+    ax_rate: plt.Axes,
+    ax_secondary: Optional[plt.Axes] = None,
+) -> None:
+    """
+    Force the bottom x-axis to behave like the old working plot.
+
+    If a secondary axis exists for the raw pulse-count underlay, it must not
+    own or draw x-axis labels. The primary rate axis always owns the vertical
+    date labels.
+    """
+    if ax_secondary is not None:
+        ax_secondary.tick_params(
+            axis="x",
+            which="both",
+            bottom=False,
+            top=False,
+            labelbottom=False,
+            labeltop=False,
+        )
+
+    ax_rate.tick_params(axis="x", which="major", labelrotation=90, labelsize=6, labelbottom=True)
+
+    fig.canvas.draw()
+    for label in ax_rate.get_xticklabels(which="major"):
+        label.set_rotation(90)
+        label.set_fontsize(6)
+        label.set_horizontalalignment("center")
+        label.set_verticalalignment("top")
+        label.set_visible(True)
+
+
+def underlay_description() -> str:
+    mode = UNDERLAY_MODE.lower().strip()
+    if mode == "pulses":
+        return "raw gas-pulse counts per bin"
+    if mode == "raw_rate":
+        return "unsmoothed resampled flow-rate grid"
+    return f"unknown UNDERLAY_MODE={UNDERLAY_MODE!r}"
+
+
+def plot_pulse_count_underlay(
+    ax_rate: plt.Axes,
+    raw_bin_times: Sequence[datetime],
+    raw_bin_counts: Sequence[int],
+    start_dt: datetime,
+    end_dt: datetime,
+) -> plt.Axes:
+    """
+    Plot the original DB pulse-count bins as a blue underlay on a secondary
+    right-side y-axis.
+
+    This is the original raw data view: count per bin, not derived flow rate.
+    """
+    ax_pulse = ax_rate.twinx()
+    ax_pulse.set_zorder(1)
+    ax_rate.set_zorder(2)
+    ax_rate.patch.set_visible(False)
+
+    if raw_bin_times and raw_bin_counts:
+        pulse_times = [t for t, c in zip(raw_bin_times, raw_bin_counts) if c > 0]
+        pulse_counts = [c for c in raw_bin_counts if c > 0]
+
+        if pulse_times:
+            ax_pulse.vlines(
+                pulse_times,
+                0,
+                pulse_counts,
+                linestyle="-",
+                linewidth=1.0,
+                alpha=0.25,
+                color="blue",
+                label="Raw gas pulses per bin",
+            )
+
+        max_pulse_count = max(raw_bin_counts) if raw_bin_counts else 0
+        ax_pulse.set_ylim(bottom=0, top=max(max_pulse_count * 1.15, 1.0))
+    else:
+        ax_pulse.set_ylim(bottom=0, top=1)
+
+    ax_pulse.set_ylabel("Raw pulse count per bin")
+    ax_pulse.set_xlim(left=start_dt, right=end_dt)
+    return ax_pulse
+
+
+def plot_unsmoothed_rate_underlay(
+    ax_rate: plt.Axes,
+    grid_times: Sequence[datetime],
+    grid_vals: Sequence[float],
+) -> None:
+    """
+    Plot the unsmoothed derived flow-rate grid as a blue underlay on the main
+    flow-rate y-axis.
+
+    This is not the raw DB count data. It is the regular-grid rate series before
+    the centered EMA is applied.
+    """
+    if not grid_times or not grid_vals:
+        return
+
+    ax_rate.plot(
+        grid_times,
+        grid_vals,
+        linestyle="-",
+        linewidth=0.8,
+        alpha=0.30,
+        color="blue",
+        label="Unsmoothed rate grid",
+    )
+
+
 def plot_rate_series(
     rate_times: Sequence[datetime],
     rate_vals: Sequence[float],
+    raw_bin_times: Sequence[datetime],
+    raw_bin_counts: Sequence[int],
     start_dt: datetime,
     end_dt: datetime,
     total_gas_m3: float,
     total_pulses: int,
     output_file: str,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(14, 5))
+    fig, ax_rate = plt.subplots(figsize=(14, 5))
+
+    mode = UNDERLAY_MODE.lower().strip()
+    if mode not in {"pulses", "raw_rate"}:
+        raise ValueError('UNDERLAY_MODE must be "pulses" or "raw_rate"')
+
+    ax_secondary: Optional[plt.Axes] = None
+
+    if mode == "pulses":
+        ax_secondary = plot_pulse_count_underlay(
+            ax_rate=ax_rate,
+            raw_bin_times=raw_bin_times,
+            raw_bin_counts=raw_bin_counts,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
 
     if rate_times and rate_vals:
         grid_times, grid_vals = resample_rate_series(rate_times, rate_vals)
-        spline_times, spline_vals = smoothing_spline_rate_series(grid_times, grid_vals)
+        smooth_times, smooth_vals = centered_exponential_average(grid_times, grid_vals)
 
-        # Raw inferred rate: visible as reference, but visually quiet.
-        ax.plot(
-            rate_times,
-            rate_vals,
-            linestyle=":",
-            linewidth=0.8,
-            alpha=0.35,
-            color="blue",
-            label="Raw inferred rate",
-        )
+        if mode == "raw_rate":
+            plot_unsmoothed_rate_underlay(ax_rate, grid_times, grid_vals)
 
-        # Optional resampled reference. Kept very faint so it does not dominate.
-        ax.plot(
-            grid_times,
-            grid_vals,
-            linestyle="--",
-            linewidth=0.7,
-            alpha=0.20,
-            color="gray",
-            label=f"Resampled {RESAMPLE_GRID_S / 60:.1f} min grid",
-        )
-
-        # Main visual line: smoothing spline on the regular-grid rate series.
-        ax.plot(
-            spline_times,
-            spline_vals,
+        # Main visual line: centered exponential average on the regular-grid rate series.
+        ax_rate.plot(
+            smooth_times,
+            smooth_vals,
             linewidth=1.5,
             alpha=0.95,
             color="red",
-            label=f"Smoothing spline, residual {SPLINE_RESIDUAL_M3H:.2f} m³/h",
+            label=f"Centered EMA, ±{CENTERED_EMA_RADIUS} samples",
         )
 
-        max_y = max(max(rate_vals), max(grid_vals), max(spline_vals))
+        max_y = max(max(rate_vals), max(grid_vals), max(smooth_vals))
         ymax = max_y * 1.10 if max_y > 0 else 1.0
-        ax.set_ylim(bottom=0, top=ymax)
-        ax.set_xlim(left=start_dt, right=end_dt)
+        ax_rate.set_ylim(bottom=0, top=ymax)
+        ax_rate.set_xlim(left=start_dt, right=end_dt)
     else:
-        ax.text(
+        ax_rate.text(
             0.5,
             0.5,
             "Not enough pulses to derive a flow-rate series",
             ha="center",
             va="center",
-            transform=ax.transAxes,
+            transform=ax_rate.transAxes,
         )
-        ax.set_ylim(bottom=0, top=1)
-        ax.set_xlim(left=start_dt, right=end_dt)
+        ax_rate.set_ylim(bottom=0, top=1)
+        ax_rate.set_xlim(left=start_dt, right=end_dt)
 
     total_days = max((end_dt.timestamp() - start_dt.timestamp()) / 86400.0, 1e-9)
-    configure_time_axis(ax, total_days)
+    configure_time_axis(ax_rate, total_days)
 
-    ax.axhline(0, linewidth=0.8)
-    ax.set_ylabel("Flow rate (m³/hour)")
-    ax.set_title(
+    ax_rate.axhline(0, linewidth=0.8)
+    ax_rate.set_ylabel("Flow rate (m³/hour)")
+    ax_rate.set_title(
         "Gas Flow Rate – inferred from 0.01 m³ pulses\n"
         f"{start_dt.strftime('%Y-%m-%d %H:%M')} → {end_dt.strftime('%Y-%m-%d %H:%M')} (GMT+8)\n"
         f"Total usage: {total_gas_m3:.2f} m³  |  Pulses: {total_pulses}"
     )
 
-    if rate_times:
-        ax.legend(loc="upper right")
+    handles_rate, labels_rate = ax_rate.get_legend_handles_labels()
+    if ax_secondary is not None:
+        handles_secondary, labels_secondary = ax_secondary.get_legend_handles_labels()
+        handles = handles_rate + handles_secondary
+        labels = labels_rate + labels_secondary
+    else:
+        handles = handles_rate
+        labels = labels_rate
 
-    plt.xticks(rotation=90, fontsize=6)
+    if handles:
+        ax_rate.legend(handles, labels, loc="upper right")
+
+    style_xaxis_like_old_plot(fig, ax_rate, ax_secondary)
+    plt.sca(ax_rate)
     plt.tight_layout()
     plt.savefig(output_file)
     plt.close(fig)
@@ -466,6 +625,7 @@ def main() -> None:
         raise SystemExit(1)
 
     pulse_epochs = build_inferred_pulse_epochs(rows)
+    raw_bin_times, raw_bin_counts = build_raw_bin_count_series(rows)
     total_pulses = len(pulse_epochs)
     total_gas_m3 = total_pulses * PULSE_M3
 
@@ -474,6 +634,8 @@ def main() -> None:
     plot_rate_series(
         rate_times=rate_times,
         rate_vals=rate_vals,
+        raw_bin_times=raw_bin_times,
+        raw_bin_counts=raw_bin_counts,
         start_dt=start_dt,
         end_dt=end_dt,
         total_gas_m3=total_gas_m3,
@@ -487,7 +649,9 @@ def main() -> None:
         f"\nTotal usage: {total_gas_m3:.2f} m³"
         f"\nPulses: {total_pulses}"
         f"\nResample grid: {RESAMPLE_GRID_S / 60:.1f} minutes"
-        f"\nSmoothing spline residual: {SPLINE_RESIDUAL_M3H:.2f} m³/hour"
+        f"\nCentered EMA radius: ±{CENTERED_EMA_RADIUS} samples"
+        f"\nCentered EMA decay: {CENTERED_EMA_DECAY:.1f}"
+        f"\nUnderlay: {underlay_description()}"
         "\nPulse timing within each bin is inferred by even spacing."
         "\n(trimmed to 31 days if applicable)\n"
     )

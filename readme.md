@@ -211,7 +211,7 @@ Use the Sunflower **5 V output** into the ESP32 VIN/5V input and let the ESP32 b
      ┌─────────────────────────────────────────────────┐
      │                  Raspberry Pi                   │
      │  Mosquitto MQTT Broker + SQLite Logger          │
-     │  logs → /home/pi/mqtt_log.db                    │
+     │  logs → /home/pi/gasmon/mqtt_log.db                    │
      └─────────────────────────────────────────────────┘
                                │
                          Email commands
@@ -266,7 +266,7 @@ mosquitto_sub -t metering/# -v
 Database location:
 
 ```text
-/home/pi/mqtt_log.db
+/home/pi/gasmon/mqtt_log.db
 ```
 
 Schema:
@@ -312,13 +312,13 @@ Older plot style:
 Current script:
 
 ```text
-/home/pi/gas_plot_rate.py
+/home/pi/gasmon/gas_plot_rate.py
 ```
 
 Output file:
 
 ```text
-/home/pi/gas_plot_rate.png
+/home/pi/gasmon/gas_plot_rate.png
 ```
 
 The flow-rate plot converts binned pulse counts into an inferred gas flow-rate time series.
@@ -330,7 +330,7 @@ raw DB bin counts
 → inferred individual pulse timestamps
 → interval-based flow-rate points
 → regular-grid resampling
-→ smoothing spline
+→ centered exponential moving average
 → flow-rate line plot
 ```
 
@@ -353,66 +353,51 @@ rate_timestamp = midpoint(t_prev, t_now)
 ```
 
 5. Resample the interval-rate series onto a regular time grid.
-6. Fit a smoothing spline to the regular-grid rate series.
+6. Smooth the regular-grid rate series using a centred exponential moving average.
 7. Plot:
-   - raw inferred rate as a faint dotted reference line
-   - spline-smoothed rate as the main red line
+   - optional raw DB pulse-count bins on a secondary y-axis, or
+   - optional unsmoothed resampled rate grid on the main y-axis, and
+   - the centred EMA flow-rate line as the main red line
 
-This replaced the earlier Gaussian time-window smoothing. It also avoids the older fixed N-point moving-average problem, where the same number of points could represent minutes during active gas use but many hours during quiet pilot-light use.
+This avoids the older fixed N-point moving-average problem, where the same number of points could represent minutes during active gas use but many hours during quiet pilot-light use. The centred smoother uses both past and future samples, so it is for historical plotting only, not live prediction.
 
-## Spline smoothing settings
+## Centered EMA smoothing settings
 
 Current smoothing parameters in `gas_plot_rate.py`:
 
 ```python
-RESAMPLE_GRID_S = 150.0       # 2.5-minute regular grid
-SPLINE_RESIDUAL_M3H = 0.025   # lower = less smooth / closer to raw
-SPLINE_ORDER = 3              # cubic smoothing spline
+RESAMPLE_GRID_S = 100.0       # regular time grid in seconds
+CENTERED_EMA_RADIUS = 8       # samples before/after the current point
+CENTERED_EMA_DECAY = 2.0      # lower = more local; higher = smoother/flatter
+UNDERLAY_MODE = "pulses"      # "pulses" or "raw_rate"
 ```
 
 Tuning guide:
 
 ```text
-SPLINE_RESIDUAL_M3H lower  → less smoothing, closer to raw rate shape
-SPLINE_RESIDUAL_M3H higher → more smoothing, softer curve
-RESAMPLE_GRID_S = 150      → 2.5-minute grid, current preferred setting
-RESAMPLE_GRID_S = 300      → 5-minute grid, simpler/coarser plot
+RESAMPLE_GRID_S lower       → finer grid, more detail
+RESAMPLE_GRID_S higher      → coarser grid, calmer plot
+CENTERED_EMA_RADIUS lower   → less smoothing
+CENTERED_EMA_RADIUS higher  → more smoothing
+CENTERED_EMA_DECAY lower    → more local weighting
+CENTERED_EMA_DECAY higher   → flatter/smoother weighting
 ```
 
-The current preferred value is:
+The current preferred setting is:
 
 ```python
-SPLINE_RESIDUAL_M3H = 0.025
+RESAMPLE_GRID_S = 100.0
+CENTERED_EMA_RADIUS = 8
+CENTERED_EMA_DECAY = 2.0
+UNDERLAY_MODE = "pulses"
 ```
 
-This gives a smooth curve while still following the gas-use events closely.
+## Python dependencies
 
-## Python dependency
-
-The spline plotter requires SciPy:
+The plotter requires NumPy and Matplotlib:
 
 ```bash
-sudo apt install python3-scipy
-```
-
-On older Raspberry Pi OS / Raspbian Buster systems, the normal Raspbian package mirror may no longer contain Buster packages. If `apt update` gives Buster 404 errors, update `/etc/apt/sources.list` from:
-
-```text
-http://raspbian.raspberrypi.org/raspbian/
-```
-
-to:
-
-```text
-http://legacy.raspbian.org/raspbian/
-```
-
-Then run:
-
-```bash
-sudo apt clean
-sudo apt update
-sudo apt install python3-scipy
+sudo apt install python3-numpy python3-matplotlib
 ```
 
 ## Flow-rate interpretation
@@ -431,7 +416,7 @@ Examples:
 
 The database stores **counts per bin**, not exact pulse timestamps. When a bin has multiple pulses, the exact timing inside that bin is lost. The plot therefore uses evenly spaced inferred timestamps inside each bin.
 
-The spline-smoothed line is for visual interpretation only. It should not be used as the source of truth for total gas usage. Total gas usage should always come from raw pulse count:
+The smoothed line is for visual interpretation only. It should not be used as the source of truth for total gas usage. Total gas usage should always come from raw pulse count:
 
 ```text
 total_gas_m3 = total_pulses × 0.01
@@ -460,7 +445,19 @@ Service file:
 Script:
 
 ```text
-/home/pi/email_listener.py
+/home/pi/gasmon/email_listener.py
+```
+
+MQTT logger service:
+
+```text
+/etc/systemd/system/mqtt_logger.service
+```
+
+MQTT logger script:
+
+```text
+/home/pi/gasmon/mqtt_logger.py
 ```
 
 Processes commands such as:
@@ -485,7 +482,7 @@ Only accepts commands when:
 Daily gas flow-rate chart at 7:00am:
 
 ```cron
-0 7 * * * /usr/bin/python3 /home/pi/gas_plot_rate.py last48 >> /home/pi/gas_plot.log 2>&1
+0 7 * * * /usr/bin/python3 /home/pi/gasmon/gas_plot_rate.py last48 >> /home/pi/gasmon/gas_plot.log 2>&1
 ```
 
 Check installed crontab:
@@ -497,13 +494,13 @@ crontab -l
 Manual test of the exact cron command:
 
 ```bash
-/usr/bin/python3 /home/pi/gas_plot_rate.py last48 >> /home/pi/gas_plot.log 2>&1
+/usr/bin/python3 /home/pi/gasmon/gas_plot_rate.py last48 >> /home/pi/gasmon/gas_plot.log 2>&1
 ```
 
 Check log:
 
 ```bash
-tail -50 /home/pi/gas_plot.log
+tail -50 /home/pi/gasmon/gas_plot.log
 ```
 
 ---
@@ -539,12 +536,12 @@ Most likely causes:
 
 Check:
 
-- The script is using `gas_plot_rate.py`, not the old raw-bin plot script.
-- SciPy is installed and importable with `python3 -c "import scipy; print(scipy.__version__)"`.
-- The plot is using regular-grid resampling plus smoothing spline, not the older Gaussian smoother and not a fixed N-point moving average.
-- `SPLINE_RESIDUAL_M3H` is not too high. Higher values smooth more aggressively.
-- Current preferred setting is `SPLINE_RESIDUAL_M3H = 0.025`.
-- `RESAMPLE_GRID_S` is set to `150.0` for the current 2.5-minute grid, or `300.0` if a coarser 5-minute grid is wanted.
+- The script is using `/home/pi/gasmon/gas_plot_rate.py`, not an old copy in `/home/pi`.
+- NumPy and Matplotlib are installed and importable.
+- The plot is using regular-grid resampling plus centred EMA smoothing, not the older Gaussian smoother, smoothing spline, or fixed N-point moving average.
+- `CENTERED_EMA_RADIUS` is not too high. Higher values smooth more aggressively.
+- `CENTERED_EMA_DECAY` is not too high. Higher values make the curve flatter.
+- `RESAMPLE_GRID_S` is set to `100.0` for the current grid, or higher if a coarser plot is wanted.
 - Raw total gas usage still matches `pulse_count × 0.01`.
 
 ## No IMAP connection
@@ -560,11 +557,11 @@ Try again; the script retries and restarts WiFi on repeated SMTP failure.
 Email listener log:
 
 ```bash
-tail -f /home/pi/email_listener.log
+tail -f /home/pi/gasmon/email_listener.log
 ```
 
 Gas plot cron log:
 
 ```bash
-tail -f /home/pi/gas_plot.log
+tail -f /home/pi/gasmon/gas_plot.log
 ```
