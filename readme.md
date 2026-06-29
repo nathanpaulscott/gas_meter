@@ -211,7 +211,7 @@ Use the Sunflower **5 V output** into the ESP32 VIN/5V input and let the ESP32 b
      ┌─────────────────────────────────────────────────┐
      │                  Raspberry Pi                   │
      │  Mosquitto MQTT Broker + SQLite Logger          │
-     │  logs → /home/pi/gasmon/mqtt_log.db                    │
+     │  logs → /home/pi/gasmon/mqtt_log.db             │
      └─────────────────────────────────────────────────┘
                                │
                          Email commands
@@ -328,8 +328,8 @@ Processing strategy:
 ```text
 raw DB bin counts
 → inferred individual pulse timestamps
-→ interval-based flow-rate points
-→ regular-grid resampling
+→ constant-rate pulse-to-pulse intervals
+→ duration-weighted resampling onto a regular grid
 → centered exponential moving average
 → flow-rate line plot
 ```
@@ -342,24 +342,25 @@ Detailed logic:
    - count = 1 → one pulse timestamp at the bin centre
    - count = N → N pulse timestamps evenly spaced inside the bin
 3. Sort all inferred pulse timestamps.
-4. For each consecutive pulse pair:
+4. For each consecutive pulse pair, treat the full pulse-to-pulse interval as one constant-rate segment:
 
 ```text
 t_prev = previous pulse time
 t_now  = current pulse time
 dt_s   = t_now - t_prev
 rate_m3_per_hour = 0.01 × 3600 / dt_s
-rate_timestamp = midpoint(t_prev, t_now)
 ```
 
-5. Resample the interval-rate series onto a regular time grid.
+This rate applies over the whole interval `[t_prev, t_now]`, not just at the midpoint.
+
+5. Resample the constant-rate intervals onto a regular time grid using duration-weighted overlap averaging.
 6. Smooth the regular-grid rate series using a centred exponential moving average.
 7. Plot:
    - optional raw DB pulse-count bins on a secondary y-axis, or
-   - optional unsmoothed resampled rate grid on the main y-axis, and
+   - optional unsmoothed resampled step-rate grid on the main y-axis, and
    - the centred EMA flow-rate line as the main red line
 
-This avoids the older fixed N-point moving-average problem, where the same number of points could represent minutes during active gas use but many hours during quiet pilot-light use. The centred smoother uses both past and future samples, so it is for historical plotting only, not live prediction.
+This avoids the older fixed N-point moving-average problem, where the same number of points could represent minutes during active gas use but many hours during quiet pilot-light use. It also avoids the older midpoint-rate plus linear-interpolation approximation. The centred smoother uses both past and future samples, so it is for historical plotting only, not live prediction.
 
 ## Centered EMA smoothing settings
 
@@ -399,6 +400,24 @@ The plotter requires NumPy and Matplotlib:
 ```bash
 sudo apt install python3-numpy python3-matplotlib
 ```
+
+## Step-rate grid resampling
+
+Before smoothing, the derived flow-rate series is treated as a step function.
+
+Each pulse-to-pulse interval contributes gas volume over time:
+
+```text
+interval_rate = 0.01 × 3600 / interval_duration_seconds
+```
+
+For each regular grid cell, the plotted unsmoothed rate is the duration-weighted average of all pulse intervals overlapping that grid cell:
+
+```text
+grid_rate = sum(interval_rate × overlap_duration) / grid_cell_duration
+```
+
+This preserves the physical meaning better than assigning each interval rate to a midpoint and linearly interpolating between midpoints.
 
 ## Flow-rate interpretation
 
@@ -538,7 +557,7 @@ Check:
 
 - The script is using `/home/pi/gasmon/gas_plot_rate.py`, not an old copy in `/home/pi`.
 - NumPy and Matplotlib are installed and importable.
-- The plot is using regular-grid resampling plus centred EMA smoothing, not the older Gaussian smoother, smoothing spline, or fixed N-point moving average.
+- The plot is using pulse-interval step functions, duration-weighted grid resampling, and centred EMA smoothing, not the older Gaussian smoother, smoothing spline, midpoint interpolation, or fixed N-point moving average.
 - `CENTERED_EMA_RADIUS` is not too high. Higher values smooth more aggressively.
 - `CENTERED_EMA_DECAY` is not too high. Higher values make the curve flatter.
 - `RESAMPLE_GRID_S` is set to `100.0` for the current grid, or higher if a coarser plot is wanted.

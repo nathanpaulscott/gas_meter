@@ -45,10 +45,11 @@ MAX_RANGE_SEC = 31 * 86400
 PULSE_M3 = 0.01
 
 # Centered exponential moving-average settings.
-# Raw pulse-derived rate samples are irregular. This code first resamples them
-# onto a regular time grid, then smooths that regular series using a centered
-# exponential-weighted average. The smoother uses past and future samples.
-RESAMPLE_GRID_S = 100.0       # 2 minute grid. Try 300.0 for a calmer curve.
+# Pulse-derived rates are first treated as constant-rate intervals between
+# consecutive pulses. Those intervals are resampled onto a regular time grid
+# using duration-weighted overlap, then smoothed using a centered exponential
+# weighted average. The smoother uses past and future samples.
+RESAMPLE_GRID_S = 100.0       # 100 second grid. Try 300.0 for a calmer curve.
 CENTERED_EMA_RADIUS = 8       # 8 before + current + 8 after = 17 samples.
 CENTERED_EMA_DECAY = 2.0      # lower = more local; higher = flatter/smoother.
 
@@ -221,81 +222,91 @@ def build_raw_bin_count_series(rows: Sequence[Tuple[float, str]]) -> Tuple[List[
 # RATE DERIVATION
 # ======================================================
 
-def build_rate_series(pulse_epochs: Sequence[float]) -> Tuple[List[datetime], List[float]]:
+def build_rate_intervals(pulse_epochs: Sequence[float]) -> Tuple[List[float], List[float], List[float]]:
     """
-    Convert inferred pulse timestamps into interval-rate samples.
+    Convert inferred pulse timestamps into constant-rate pulse intervals.
 
-    Each pulse represents 0.01 m³. For each consecutive pulse pair, the gas
-    flow rate is assigned to the midpoint between those two pulses.
+    Each consecutive pulse pair defines one interval [pulse_i, pulse_i+1].
+    The rate over that full interval is 0.01 m³ divided by the interval
+    duration, expressed as m³/hour.
     """
-    rate_times: List[datetime] = []
-    rate_vals: List[float] = []
+    interval_starts: List[float] = []
+    interval_ends: List[float] = []
+    interval_rates: List[float] = []
 
     if len(pulse_epochs) < 2:
-        return rate_times, rate_vals
+        return interval_starts, interval_ends, interval_rates
 
     prev = pulse_epochs[0]
     for now in pulse_epochs[1:]:
         dt_s = now - prev
+
         if dt_s > 0:
-            midpoint_epoch = prev + dt_s / 2.0
             rate_m3_per_hour = PULSE_M3 * 3600.0 / dt_s
-            rate_times.append(datetime.fromtimestamp(midpoint_epoch, tz=LOCAL_TZ))
-            rate_vals.append(rate_m3_per_hour)
+            interval_starts.append(float(prev))
+            interval_ends.append(float(now))
+            interval_rates.append(float(rate_m3_per_hour))
+
         prev = now
 
-    return rate_times, rate_vals
+    return interval_starts, interval_ends, interval_rates
 
 
-def resample_rate_series(
-    rate_times: Sequence[datetime],
-    rate_vals: Sequence[float],
+def resample_rate_intervals_step(
+    interval_starts: Sequence[float],
+    interval_ends: Sequence[float],
+    interval_rates: Sequence[float],
     grid_s: float = RESAMPLE_GRID_S,
 ) -> Tuple[List[datetime], List[float]]:
     """
-    Resample the irregular midpoint rate samples onto a regular time grid.
+    Resample constant-rate pulse intervals onto a regular time grid.
 
-    This uses simple linear interpolation. The regular grid then makes the
-    centered smoother behaviour more predictable than fitting directly to a
-    highly irregular point sequence.
+    Each pulse interval is treated as a step function. Each output grid value
+    is the duration-weighted average rate over that grid cell. This avoids
+    assigning interval rates to midpoints and linearly interpolating them.
     """
-    if not rate_times or not rate_vals:
+    if not interval_starts or not interval_ends or not interval_rates:
         return [], []
 
-    if len(rate_times) != len(rate_vals):
-        raise ValueError("rate_times and rate_vals must have the same length")
+    if not (len(interval_starts) == len(interval_ends) == len(interval_rates)):
+        raise ValueError("interval_starts, interval_ends, and interval_rates must have the same length")
 
-    if len(rate_times) == 1:
-        return list(rate_times), list(rate_vals)
+    grid_s = float(grid_s)
+    if grid_s <= 0:
+        raise ValueError("grid_s must be > 0")
 
-    epochs = np.array([t.timestamp() for t in rate_times], dtype=float)
-    vals = np.array(rate_vals, dtype=float)
+    start_epoch = float(interval_starts[0])
+    end_epoch = float(interval_ends[-1])
 
-    # Remove duplicate timestamps by averaging their values.
-    unique_epochs: List[float] = []
-    unique_vals: List[float] = []
+    if end_epoch <= start_epoch:
+        return [], []
 
-    i = 0
-    while i < len(epochs):
-        t = epochs[i]
-        same_vals = [vals[i]]
-        i += 1
-        while i < len(epochs) and epochs[i] == t:
-            same_vals.append(vals[i])
-            i += 1
-        unique_epochs.append(float(t))
-        unique_vals.append(float(np.mean(same_vals)))
+    grid_starts = np.arange(start_epoch, end_epoch, grid_s, dtype=float)
+    grid_ends = np.minimum(grid_starts + grid_s, end_epoch)
+    grid_vals = np.zeros(len(grid_starts), dtype=float)
 
-    epochs = np.array(unique_epochs, dtype=float)
-    vals = np.array(unique_vals, dtype=float)
+    for int_start, int_end, rate in zip(interval_starts, interval_ends, interval_rates):
+        int_start = float(int_start)
+        int_end = float(int_end)
+        rate = float(rate)
 
-    if len(epochs) < 2:
-        return [datetime.fromtimestamp(float(epochs[0]), tz=LOCAL_TZ)], [float(vals[0])]
+        if int_end <= int_start:
+            continue
 
-    grid_epochs = np.arange(epochs[0], epochs[-1] + grid_s, grid_s, dtype=float)
-    grid_vals = np.interp(grid_epochs, epochs, vals)
+        first_idx = max(0, int((int_start - start_epoch) // grid_s))
+        last_idx = min(len(grid_starts) - 1, int((int_end - start_epoch) // grid_s))
 
-    grid_times = [datetime.fromtimestamp(float(t), tz=LOCAL_TZ) for t in grid_epochs]
+        for idx in range(first_idx, last_idx + 1):
+            overlap_start = max(int_start, grid_starts[idx])
+            overlap_end = min(int_end, grid_ends[idx])
+            overlap_s = overlap_end - overlap_start
+
+            if overlap_s > 0:
+                cell_duration_s = grid_ends[idx] - grid_starts[idx]
+                grid_vals[idx] += rate * (overlap_s / cell_duration_s)
+
+    grid_centres = grid_starts + (grid_ends - grid_starts) / 2.0
+    grid_times = [datetime.fromtimestamp(float(t), tz=LOCAL_TZ) for t in grid_centres]
     return grid_times, [float(v) for v in grid_vals]
 
 
@@ -464,8 +475,8 @@ def plot_unsmoothed_rate_underlay(
     Plot the unsmoothed derived flow-rate grid as a blue underlay on the main
     flow-rate y-axis.
 
-    This is not the raw DB count data. It is the regular-grid rate series before
-    the centered EMA is applied.
+    This is not the raw DB count data. It is the duration-weighted regular-grid
+    rate series before the centered EMA is applied.
     """
     if not grid_times or not grid_vals:
         return
@@ -477,13 +488,14 @@ def plot_unsmoothed_rate_underlay(
         linewidth=0.8,
         alpha=0.30,
         color="blue",
-        label="Unsmoothed rate grid",
+        label="Unsmoothed step-resampled rate grid",
     )
 
 
 def plot_rate_series(
-    rate_times: Sequence[datetime],
-    rate_vals: Sequence[float],
+    interval_starts: Sequence[float],
+    interval_ends: Sequence[float],
+    interval_rates: Sequence[float],
     raw_bin_times: Sequence[datetime],
     raw_bin_counts: Sequence[int],
     start_dt: datetime,
@@ -509,8 +521,12 @@ def plot_rate_series(
             end_dt=end_dt,
         )
 
-    if rate_times and rate_vals:
-        grid_times, grid_vals = resample_rate_series(rate_times, rate_vals)
+    if interval_starts and interval_ends and interval_rates:
+        grid_times, grid_vals = resample_rate_intervals_step(
+            interval_starts,
+            interval_ends,
+            interval_rates,
+        )
         smooth_times, smooth_vals = centered_exponential_average(grid_times, grid_vals)
 
         if mode == "raw_rate":
@@ -526,7 +542,7 @@ def plot_rate_series(
             label=f"Centered EMA, ±{CENTERED_EMA_RADIUS} samples",
         )
 
-        max_y = max(max(rate_vals), max(grid_vals), max(smooth_vals))
+        max_y = max(max(interval_rates), max(grid_vals), max(smooth_vals))
         ymax = max_y * 1.10 if max_y > 0 else 1.0
         ax_rate.set_ylim(bottom=0, top=ymax)
         ax_rate.set_xlim(left=start_dt, right=end_dt)
@@ -629,11 +645,12 @@ def main() -> None:
     total_pulses = len(pulse_epochs)
     total_gas_m3 = total_pulses * PULSE_M3
 
-    rate_times, rate_vals = build_rate_series(pulse_epochs)
+    interval_starts, interval_ends, interval_rates = build_rate_intervals(pulse_epochs)
 
     plot_rate_series(
-        rate_times=rate_times,
-        rate_vals=rate_vals,
+        interval_starts=interval_starts,
+        interval_ends=interval_ends,
+        interval_rates=interval_rates,
         raw_bin_times=raw_bin_times,
         raw_bin_counts=raw_bin_counts,
         start_dt=start_dt,
